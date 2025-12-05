@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-剧集自动重命名 v3.0（已合并 A 方案智能识别）
-- 保留并兼容 v2.0 的所有增强（拖拽、颜色渲染补丁、多线程、Undo、日志、自动预览防抖等）
-- 新增 A 方案：高级规则智能识别（SxxEyy、2x03、中文“第x集”、纯数字推断、提取集标题）
-- UI 增加选项：是否在新文件名中追加“集标题”（默认 ON，可在设置中切换）
-- 默认模板保持为： {title}.S{season:02}E{episode:03}.{ext}
+剧集自动重命名 v3.1（支持完整设置持久化）
+- 配置保存到软件同目录的 config.json
+- 记住所有设置项：剧名、季数、补零位数、偏移量、递归、Dry-run、模板、排序方式、集标题开关、冲突后缀、季文件夹开关、最近文件夹
+- 其余逻辑保持 v3.0 行为不变
 """
+
 import os, re, sys, csv, time, json, shutil
 import concurrent.futures
 import tkinter as tk
@@ -21,10 +21,21 @@ try:
 except Exception:
     USE_TKINTERDND = False
 
+# ======================================================
+# 应用目录 & 配置文件路径：改为软件同目录
+# ======================================================
+def get_app_dir():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        return os.getcwd()
+
+APP_DIR = get_app_dir()
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+
 # ========== 配置 ==========
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".ts", ".m4v"}
 AUTO_PREVIEW_DEBOUNCE_MS = 300
-CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".剧集自动重命名_config.json")
 MAX_RECENT = 10
 EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
@@ -35,10 +46,11 @@ _STOP_TOKENS = set([
     "x264","x265","h264","h265","hevc","AVC","AAC","DDP","DDP5.1","DD+","Atmos",
     "HEVC","10bit","8bit","PROPER","REPACK","EXTENDED","UNRATED"
 ])
-# normalize stop tokens to lower
 _STOP_TOKENS = {t.lower() for t in _STOP_TOKENS}
 
-# ========== 工具函数 ==========
+# ======================================================
+# 工具函数
+# ======================================================
 def natural_key(s):
     parts = re.split(r'(\d+)', s)
     key = []
@@ -52,7 +64,9 @@ def natural_key(s):
 def is_video(filename):
     return os.path.splitext(filename)[1].lower() in VIDEO_EXTS
 
-# ========== 智能识别 A 方案： parse_episode_info ==========
+# ======================================================
+# 智能识别 A 方案： parse_episode_info
+# ======================================================
 def parse_episode_info(filename):
     """
     高级规则解析：
@@ -86,7 +100,6 @@ def parse_episode_info(filename):
             if re.fullmatch(r'\[.*\]|\(.*\)', tok):
                 continue
             out_tokens.append(tok)
-            # stop if token looks like language/tag separated by uppercase groups (best effort)
         if not out_tokens:
             return None
         # join using '.' to mimic scene naming
@@ -157,7 +170,9 @@ def parse_episode_info(filename):
     # nothing found
     return None, None, None
 
-# ========== 其余工具 ==========
+# ======================================================
+# 模板格式化
+# ======================================================
 def format_template(template, title, season, episode, ext, orig):
     try:
         s = 0 if season is None else int(season)
@@ -170,15 +185,40 @@ def format_template(template, title, season, episode, ext, orig):
         out = out.replace("{episode}", str(episode if episode is not None else 0)).replace("{ep}", str(episode if episode is not None else 0))
         return out
 
-# ========== 配置管理 ==========
+# ======================================================
+# 配置管理：保存所有设置到同目录 config.json
+# ======================================================
+DEFAULT_CONFIG = {
+    "recent_folders": [],
+    "title": "",
+    "season": "1",
+    "pad": 3,
+    "offset": 0,
+    "recursive": False,
+    "move_season_folder": False,
+    "template": "{title}.S{season:02}E{episode:03}.{ext}",
+    "conflict_suffix": "_dup",
+    "dryrun": True,
+    "sort_method": "name",  # name / guess / numeric
+    "include_episode_title": True,
+}
+
 def load_config():
+    # 选项一：如果存在就加载；不存在就创建默认再返回
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            # 补全缺失字段，兼容未来扩展
+            for k, v in DEFAULT_CONFIG.items():
+                data.setdefault(k, v)
+            return data
         except Exception:
-            return {}
-    return {}
+            # 如果读取出错，保守起见：仍然返回 DEFAULT_CONFIG，并覆盖写入一份新的
+            pass
+
+    save_config(DEFAULT_CONFIG)
+    return dict(DEFAULT_CONFIG)
 
 def save_config(cfg):
     try:
@@ -187,12 +227,17 @@ def save_config(cfg):
     except Exception as e:
         print("保存配置失败:", e)
 
-# ========== 主类 ==========
+# ======================================================
+# 主类
+# ======================================================
 class SeriesRenamerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("剧集自动重命名（专业智能版 v3.0）")
+        self.root.title("剧集自动重命名（专业智能版 v3.1）")
         self.root.geometry("1080x700")
+
+        # 先加载配置
+        self.cfg = load_config()
 
         # 数据
         self.folders = []
@@ -204,19 +249,19 @@ class SeriesRenamerApp:
         # debounce
         self._debounce_after_id = None
 
-        # variables
-        self.var_recursive = tk.BooleanVar(value=False)
-        self.var_template = tk.StringVar(value="{title}.S{season:02}E{episode:03}.{ext}")
-        self.var_title = tk.StringVar(value="")
-        self.var_season = tk.StringVar(value="1")
-        self.var_pad = tk.IntVar(value=3)
-        self.var_offset = tk.IntVar(value=0)
-        self.var_move_season_folder = tk.BooleanVar(value=False)
-        self.var_conflict_suffix = tk.StringVar(value="_dup")
-        self.var_dryrun = tk.BooleanVar(value=True)
-        self.var_sort_method = tk.StringVar(value="name")
-        # 新增：是否在新文件名中追加解析到的集标题（你选项 C）
-        self.var_include_episode_title = tk.BooleanVar(value=True)
+        # variables（初始值从配置恢复）
+        self.var_recursive = tk.BooleanVar(value=bool(self.cfg.get("recursive", False)))
+        self.var_template = tk.StringVar(value=self.cfg.get("template", DEFAULT_CONFIG["template"]))
+        self.var_title = tk.StringVar(value=self.cfg.get("title", ""))
+        self.var_season = tk.StringVar(value=self.cfg.get("season", "1"))
+        self.var_pad = tk.IntVar(value=int(self.cfg.get("pad", 3)))
+        self.var_offset = tk.IntVar(value=int(self.cfg.get("offset", 0)))
+        self.var_move_season_folder = tk.BooleanVar(value=bool(self.cfg.get("move_season_folder", False)))
+        self.var_conflict_suffix = tk.StringVar(value=self.cfg.get("conflict_suffix", "_dup"))
+        self.var_dryrun = tk.BooleanVar(value=bool(self.cfg.get("dryrun", True)))
+        self.var_sort_method = tk.StringVar(value=self.cfg.get("sort_method", "name"))
+        # 新增：是否在新文件名中追加解析到的集标题
+        self.var_include_episode_title = tk.BooleanVar(value=bool(self.cfg.get("include_episode_title", True)))
 
         # UI
         self._build_ui()
@@ -232,6 +277,9 @@ class SeriesRenamerApp:
                 pass
         else:
             self.status_set("提示：未检测到 tkinterdnd2，拖拽功能需安装（pip install tkinterdnd2）。仍可用“添加文件夹”。")
+
+        # 启动时立即保存一次（保证 config.json 完整）
+        self._save_all_config()
 
     # ----- UI -----
     def _build_ui(self):
@@ -338,7 +386,38 @@ class SeriesRenamerApp:
         for i, e in enumerate(exts):
             self.ext_colors[e] = palette[i % len(palette)]
 
-    # ========== drag & drop handling ==========
+    # ========== 配置保存辅助 ==========
+    def _save_all_config(self):
+        cfg = dict(self.cfg) if hasattr(self, "cfg") else dict(DEFAULT_CONFIG)
+        # 最近文件夹（只存存在的）
+        recent = [p for p in self.folders if os.path.isdir(p)]
+        recent = recent[-MAX_RECENT:]
+        cfg["recent_folders"] = recent
+
+        cfg["title"] = self.var_title.get()
+        cfg["season"] = self.var_season.get()
+        # 防止非法输入导致崩溃
+        try:
+            cfg["pad"] = int(self.var_pad.get())
+        except Exception:
+            cfg["pad"] = DEFAULT_CONFIG["pad"]
+        try:
+            cfg["offset"] = int(self.var_offset.get())
+        except Exception:
+            cfg["offset"] = DEFAULT_CONFIG["offset"]
+
+        cfg["recursive"] = bool(self.var_recursive.get())
+        cfg["move_season_folder"] = bool(self.var_move_season_folder.get())
+        cfg["template"] = self.var_template.get()
+        cfg["conflict_suffix"] = self.var_conflict_suffix.get()
+        cfg["dryrun"] = bool(self.var_dryrun.get())
+        cfg["sort_method"] = self.var_sort_method.get()
+        cfg["include_episode_title"] = bool(self.var_include_episode_title.get())
+
+        self.cfg = cfg
+        save_config(cfg)
+
+    # ========= drag & drop handling =========
     def _on_drop(self, event):
         data = event.data
         paths = self._parse_dnd_paths(data)
@@ -378,7 +457,7 @@ class SeriesRenamerApp:
 
     # ========== recent folders ==========
     def _load_recent(self):
-        cfg = load_config()
+        cfg = getattr(self, "cfg", load_config())
         recent = cfg.get("recent_folders", [])
         for p in recent:
             if os.path.isdir(p) and p not in self.folders:
@@ -389,11 +468,8 @@ class SeriesRenamerApp:
             self.scan_async()
 
     def _save_recent(self):
-        cfg = load_config()
-        recent = [p for p in self.folders if os.path.isdir(p)]
-        recent = recent[-MAX_RECENT:]
-        cfg["recent_folders"] = recent
-        save_config(cfg)
+        # 现在所有保存统一走 _save_all_config
+        self._save_all_config()
 
     def _add_folder_internal(self, path):
         self.folders.append(path)
@@ -411,11 +487,21 @@ class SeriesRenamerApp:
                 pass
 
     def _debounce_preview(self):
+        # 设置变化时顺便保存配置
+        try:
+            self._save_all_config()
+        except Exception:
+            pass
         if self._debounce_after_id:
             self.root.after_cancel(self._debounce_after_id)
         self._debounce_after_id = self.root.after(AUTO_PREVIEW_DEBOUNCE_MS, self.preview)
 
     def _on_setting_change(self):
+        # 保存配置 + 自动预览
+        try:
+            self._save_all_config()
+        except Exception:
+            pass
         self._debounce_preview()
 
     # ========== folder ops ==========
@@ -679,7 +765,7 @@ class SeriesRenamerApp:
 
     def _execute_task(self):
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        # 日志输出到脚本同目录下的 logs/ 文件夹，保证目录整洁
+        # 日志输出到脚本同目录下的 logs/ 文件夹
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
         except Exception:
@@ -854,4 +940,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
